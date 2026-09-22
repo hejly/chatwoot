@@ -1,0 +1,77 @@
+name: Build Hejly Community Edition
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+
+      - name: Prepare CE build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Match publish_foss_docker.yml in this disposable CI checkout only.
+          rm -rf enterprise spec/enterprise
+          printf '\nENV CW_EDITION="ce"\n' >> docker/Dockerfile
+          echo "HEJLY_IMAGE=hejly/chatwoot:sha-${GITHUB_SHA}-ce-${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build locally without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.HEJLY_IMAGE }}
+          load: true
+          push: false
+
+      - name: Validate CE image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -e EXPECTED_SHA="$GITHUB_SHA" --entrypoint sh "$HEJLY_IMAGE" -ec '
+            test "$CW_EDITION" = ce
+            test ! -e /app/enterprise
+            test ! -e /app/spec/enterprise
+            test "$(cat /app/.git_sha)" = "$EXPECTED_SHA"
+            test -s /app/public/brand-assets/logo.svg
+            test -s /app/public/brand-assets/logo_dark.svg
+            test -s /app/public/brand-assets/logo_thumbnail.svg
+            ruby -c /app/script/hejly/configure_branding.rb
+          '
+          docker run --rm --entrypoint ruby "$HEJLY_IMAGE" \
+            -r /app/lib/chatwoot_app.rb -e 'abort "Enterprise is enabled" if ChatwootApp.enterprise?'
+
+      - name: Export image for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save "$HEJLY_IMAGE" | gzip > "$RUNNER_TEMP/hejly-ce-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hejly-ce-${{ github.sha }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/hejly-ce-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
